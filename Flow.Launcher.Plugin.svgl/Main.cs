@@ -95,8 +95,11 @@ namespace Flow.Launcher.Plugin.svgl
                 var darkPath = Path.Combine(_cacheDir, $"{item.Id}_dark.svg");
                 if (!File.Exists(darkPath))
                 {
-                    var svg = _httpClient.GetStringAsync(item.Route.Dark).GetAwaiter().GetResult();
-                    File.WriteAllText(darkPath, svg);
+                    var rawSvg = _httpClient.GetStringAsync(item.Route.Dark).GetAwaiter().GetResult();
+                    // insert black background rect immediately inside <svg> tag
+                    var tagEnd = rawSvg.IndexOf('>');
+                    var svgWithBg = rawSvg.Insert(tagEnd + 1, "<rect width=\"100%\" height=\"100%\" fill=\"black\" />");
+                    File.WriteAllText(darkPath, svgWithBg);
                 }
 
                 results.Add(new Result
