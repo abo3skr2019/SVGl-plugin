@@ -20,12 +20,11 @@ jobs:
         id: version
         uses: notiz-dev/github-action-json-property@release
         with: 
-          path: 'plugin.json'
-          prop_path: 'Version'
+          path: 'Flow.Launcher.Plugin.svgl/plugin.json'
       - run: echo ${{steps.version.outputs.prop}} 
       - name: Build
         run: |
-          dotnet publish 'Flow.Launcher.Plugin.svgl.csproj' -r win-x64  -c Release -o "Svgl-${{steps.version.outputs.prop}}"
+          dotnet publish 'Flow.Launcher.Plugin.svgl/Flow.Launcher.Plugin.svgl.csproj' -r win-x64  -c Release -o "Svgl-${{steps.version.outputs.prop}}"
           7z a -tzip "Svgl-${{steps.version.outputs.prop}}.zip" "./Svgl-${{steps.version.outputs.prop}}/*"
       - name: Publish
         uses: softprops/action-gh-release@v1
