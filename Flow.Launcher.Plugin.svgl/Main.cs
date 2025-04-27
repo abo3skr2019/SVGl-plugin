@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Net.Http;
 using Newtonsoft.Json;
 using Flow.Launcher.Plugin;
+using System.IO;
 
 namespace Flow.Launcher.Plugin.svgl
 {
@@ -14,10 +15,12 @@ namespace Flow.Launcher.Plugin.svgl
         private static DateTime _lastQueryTime = DateTime.MinValue;
         private static string _lastSearchText = string.Empty;
         private static readonly TimeSpan _debounceInterval = TimeSpan.FromMilliseconds(500);
+        private static readonly string _cacheDir = Path.Combine(Path.GetTempPath(), "FlowLauncher", "svgl_cache");
 
         public void Init(PluginInitContext context)
         {
             _context = context;
+            Directory.CreateDirectory(_cacheDir);
         }
 
         public List<Result> Query(Query query)
@@ -68,27 +71,42 @@ namespace Flow.Launcher.Plugin.svgl
 
             foreach (var item in items)
             {
+                // prepare local icon for light theme
+                var lightPath = Path.Combine(_cacheDir, $"{item.Id}_light.svg");
+                if (!File.Exists(lightPath))
+                {
+                    var svg = _httpClient.GetStringAsync(item.Route.Light).GetAwaiter().GetResult();
+                    File.WriteAllText(lightPath, svg);
+                }
+
                 results.Add(new Result
                 {
                     Title = $"{item.Title} (light)",
                     SubTitle = item.Url,
-                    IcoPath = item.Route.Light,
+                    IcoPath = lightPath,
                     Action = _ =>
                     {
-                        var svgText = _httpClient.GetStringAsync(item.Route.Light).GetAwaiter().GetResult();
-                        _context.API.CopyToClipboard(svgText);
+                        _context.API.CopyToClipboard(File.ReadAllText(lightPath));
                         return true;
                     }
                 });
+
+                // prepare local icon for dark theme
+                var darkPath = Path.Combine(_cacheDir, $"{item.Id}_dark.svg");
+                if (!File.Exists(darkPath))
+                {
+                    var svg = _httpClient.GetStringAsync(item.Route.Dark).GetAwaiter().GetResult();
+                    File.WriteAllText(darkPath, svg);
+                }
+
                 results.Add(new Result
                 {
                     Title = $"{item.Title} (dark)",
                     SubTitle = item.Url,
-                    IcoPath = item.Route.Dark,
+                    IcoPath = darkPath,
                     Action = _ =>
                     {
-                        var svgText = _httpClient.GetStringAsync(item.Route.Dark).GetAwaiter().GetResult();
-                        _context.API.CopyToClipboard(svgText);
+                        _context.API.CopyToClipboard(File.ReadAllText(darkPath));
                         return true;
                     }
                 });
