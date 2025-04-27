@@ -1,7 +1,7 @@
 {
     "ID": "AAA4B665C94142F89B7D3DDCEA5E91CF",
     "ActionKeyword": "svg",
-    "Name": "svgl",
+    "Name": "SVGl Plugin",
     "Description": "Get SVGs Copied to your clipboard from svgl",
     "Author": "AF_Askar",
     "Version": "1.0.0",
