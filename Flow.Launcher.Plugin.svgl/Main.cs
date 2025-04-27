@@ -10,6 +10,10 @@ namespace Flow.Launcher.Plugin.svgl
     {
         private PluginInitContext _context;
         private static readonly HttpClient _httpClient = new HttpClient();
+        // Debounce fields
+        private static DateTime _lastQueryTime = DateTime.MinValue;
+        private static string _lastSearchText = string.Empty;
+        private static readonly TimeSpan _debounceInterval = TimeSpan.FromMilliseconds(500);
 
         public void Init(PluginInitContext context)
         {
@@ -19,13 +23,49 @@ namespace Flow.Launcher.Plugin.svgl
         public List<Result> Query(Query query)
         {
             var results = new List<Result>();
-            var search = query.Search?.Trim();
+            var raw = query.Search; // preserve original including trailing whitespace
+            var search = raw?.Trim();
             if (string.IsNullOrEmpty(search)) return results;
+
+            var now = DateTime.Now;
+            // If search text changed and user is still typing (within debounce interval), skip
+            if (!search.Equals(_lastSearchText, StringComparison.OrdinalIgnoreCase) &&
+                now - _lastQueryTime < _debounceInterval)
+                return results;
+            _lastSearchText = search;
+            _lastQueryTime = now;
+
             var requestUrl = $"https://api.svgl.app?search={Uri.EscapeDataString(search)}";
-            var json = _httpClient.GetStringAsync(requestUrl).GetAwaiter().GetResult();
+
+            // HTTP request and JSON parsing with error handling
             List<SvglApiResult> items;
-            try { items = JsonConvert.DeserializeObject<List<SvglApiResult>>(json); }
-            catch { return results; }
+            try
+            {
+                var response = _httpClient.GetAsync(requestUrl).GetAwaiter().GetResult();
+                if (!response.IsSuccessStatusCode)
+                {
+                    results.Add(new Result
+                    {
+                        Title = $"SVGL API Error ({(int)response.StatusCode}): {response.ReasonPhrase}",
+                        SubTitle = "Rate limited or API issue, please try again later",
+                        Action = _ => false
+                    });
+                    return results;
+                }
+                var json = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                items = JsonConvert.DeserializeObject<List<SvglApiResult>>(json);
+            }
+            catch (Exception ex)
+            {
+                results.Add(new Result
+                {
+                    Title = "SVGL API Error",
+                    SubTitle = ex.Message,
+                    Action = _ => false
+                });
+                return results;
+            }
+
             foreach (var item in items)
             {
                 results.Add(new Result
