@@ -1,0 +1,12 @@
+{
+    "ID": "AAA4B665C94142F89B7D3DDCEA5E91CF",
+    "ActionKeyword": "svg",
+    "Name": "svgl",
+    "Description": "Get SVGs Copied to your clipboard from svgl",
+    "Author": "abo3skr2019",
+    "Version": "1.0.0",
+    "Language": "csharp",
+    "Website": "https://github.com/abo3skr2019/Flow.Launcher.Plugin.svgl",
+    "IcoPath": "icon.png",
+    "ExecuteFileName": "Flow.Launcher.Plugin.svgl.dll"
+}

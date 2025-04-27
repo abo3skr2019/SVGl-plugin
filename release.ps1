@@ -1,0 +1,2 @@
+dotnet publish Flow.Launcher.Plugin.svgl -c Release -r win-x64 --no-self-contained
+Compress-Archive -LiteralPath Flow.Launcher.Plugin.svgl/bin/Release/win-x64/publish -DestinationPath Flow.Launcher.Plugin.svgl/bin/svgl.zip -Force
