@@ -7,6 +7,6 @@
     "Version": "1.0.0",
     "Language": "csharp",
     "Website": "https://github.com/abo3skr2019/Flow.Launcher.Plugin.svgl",
-    "IcoPath": "icon.png",
+    "IcoPath": "icon.svg",
     "ExecuteFileName": "Flow.Launcher.Plugin.svgl.dll"
 }
