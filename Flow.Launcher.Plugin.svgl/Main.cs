@@ -93,10 +93,17 @@ namespace Flow.Launcher.Plugin.svgl
 
                 // prepare local icon for dark theme
                 var darkPath = Path.Combine(_cacheDir, $"{item.Id}_dark.svg");
-                if (!File.Exists(darkPath))
+                var darkRawPath = Path.Combine(_cacheDir, $"{item.Id}_dark_raw.svg");
+                // cache raw SVG for dark theme
+                if (!File.Exists(darkRawPath))
                 {
                     var rawSvg = _httpClient.GetStringAsync(item.Route.Dark).GetAwaiter().GetResult();
-                    // insert black background rect immediately inside <svg> tag
+                    File.WriteAllText(darkRawPath, rawSvg);
+                }
+                // generate modified SVG with black background if needed
+                if (!File.Exists(darkPath))
+                {
+                    var rawSvg = File.ReadAllText(darkRawPath);
                     var tagEnd = rawSvg.IndexOf('>');
                     var svgWithBg = rawSvg.Insert(tagEnd + 1, "<rect width=\"100%\" height=\"100%\" fill=\"black\" />");
                     File.WriteAllText(darkPath, svgWithBg);
@@ -109,7 +116,9 @@ namespace Flow.Launcher.Plugin.svgl
                     IcoPath = darkPath,
                     Action = _ =>
                     {
-                        _context.API.CopyToClipboard(File.ReadAllText(darkPath));
+                        // copy original unedited SVG to clipboard
+                        var svg = File.ReadAllText(darkRawPath);
+                        _context.API.CopyToClipboard(svg);
                         return true;
                     }
                 });
