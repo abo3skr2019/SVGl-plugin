@@ -58,11 +58,30 @@ namespace Flow.Launcher.Plugin.svgl
             }
         }
 
+        // How long to cache search results (in minutes)
+        private int _cacheLifetime = 60;
+        /// <summary>
+        /// Gets or sets the cache lifetime in minutes
+        /// </summary>
+        public int CacheLifetime
+        {
+            get => _cacheLifetime;
+            set
+            {
+                if (value < 0)
+                    value = 0;
+                _cacheLifetime = value;
+                OnPropertyChanged();
+            }
+        }
+
         /// <summary>
         /// Flag to clear the cache - not saved, just used for the UI
         /// </summary>
         [JsonIgnore]
-        public bool ClearCache { get; set; }        /// <summary>
+        public bool ClearCache { get; set; }
+
+        /// <summary>
         /// The path where cache is stored (read-only for display)
         /// </summary>
         [JsonIgnore]

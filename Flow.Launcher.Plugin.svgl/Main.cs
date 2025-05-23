@@ -8,10 +8,10 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Controls;
+using System.Linq;
 
 namespace Flow.Launcher.Plugin.svgl
-{
-    /// <summary>
+{/// <summary>
     /// SVGL Plugin for Flow Launcher to search and copy SVG icons
     /// </summary>
     public class Svgl : IPlugin, IAsyncPlugin, ISettingProvider
@@ -20,10 +20,30 @@ namespace Flow.Launcher.Plugin.svgl
         private Settings _settings;
         private SettingsViewModel _viewModel;
         private static readonly HttpClient _httpClient = new HttpClient();
-        // Debounce fields
+        
+        // Cache system with expiration
+        private static Dictionary<string, CacheEntry<List<SvglApiResult>>> _searchCache = 
+            new Dictionary<string, CacheEntry<List<SvglApiResult>>>(StringComparer.OrdinalIgnoreCase);
+        private static readonly string _cacheDir = Path.Combine(Path.GetTempPath(), "FlowLauncher", "svgl_cache");
+        
+        // Debounce and API request tracking
+        private static CancellationTokenSource _currentRequestCts;
         private static DateTime _lastQueryTime = DateTime.MinValue;
         private static string _lastSearchText = string.Empty;
-        private static readonly string _cacheDir = Path.Combine(Path.GetTempPath(), "FlowLauncher", "svgl_cache");
+        private static DateTime _lastApiCallTime = DateTime.MinValue;
+        private static SemaphoreSlim _apiSemaphore = new SemaphoreSlim(1, 1);
+        
+        // API rate limiting - default to max 10 requests per minute
+        private const int ApiMinIntervalMs = 100; // Minimum time between API calls
+        private const int ApiMaxPerMinute = 10;   // Maximum API calls per minute
+        
+        /// <summary>
+        /// Clears the in-memory search cache
+        /// </summary>
+        public static void ClearSearchCache()
+        {
+            _searchCache.Clear();
+        }
 
         /// <summary>
         /// Initialize the plugin
@@ -57,7 +77,9 @@ namespace Flow.Launcher.Plugin.svgl
         public Control CreateSettingPanel()
         {
             return new SettingsControl(_context, _viewModel);
-        }        /// <summary>
+        }
+
+        /// <summary>
         /// Query the SVGL API for SVG icons (sync version, calls async method)
         /// </summary>
         /// <param name="query">Search query from Flow Launcher</param>
@@ -78,47 +100,157 @@ namespace Flow.Launcher.Plugin.svgl
             var results = new List<Result>();
             var raw = query.Search; // preserve original including trailing whitespace
             var search = raw?.Trim();
-            if (string.IsNullOrEmpty(search)) return results;
+            
+            if (string.IsNullOrEmpty(search))
+            {
+                // When no search is provided, show placeholder result
+                results.Add(new Result
+                {
+                    Title = "Search for SVG Icons",
+                    SubTitle = "Start typing to search for icons...",
+                    IcoPath = "icon.svg",
+                    Action = _ => false
+                });
+                return results;
+            }
+
+            // Cancel any ongoing requests when user changes query
+            if (_currentRequestCts != null && search != _lastSearchText)
+            {
+                _currentRequestCts.Cancel();
+                _currentRequestCts.Dispose();
+                _currentRequestCts = null;
+            }
+
+            // Create new cancellation token source linked to the provided token
+            _currentRequestCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+            var localCts = _currentRequestCts;
 
             var now = DateTime.Now;
-            // If search text changed and user is still typing (within debounce interval), skip
+            
+            // If search text changed and user is still typing (within debounce interval), show loading state
             var debounceInterval = TimeSpan.FromMilliseconds(_settings.DebounceInterval);
             if (!search.Equals(_lastSearchText, StringComparison.OrdinalIgnoreCase) &&
                 now - _lastQueryTime < debounceInterval)
+            {
+                _lastSearchText = search;
+                _lastQueryTime = now;
+                
+                results.Add(new Result
+                {
+                    Title = $"Searching for \"{search}\"...",
+                    SubTitle = "Please wait while searching SVGL icons",
+                    IcoPath = "icon.svg",
+                    Action = _ => false
+                });
                 return results;
+            }
+            
             _lastSearchText = search;
             _lastQueryTime = now;
 
-            var requestUrl = $"https://api.svgl.app?search={Uri.EscapeDataString(search)}";
+            // Check cache first with expiration
+            if (_searchCache.TryGetValue(search, out var cachedEntry) && 
+                cachedEntry != null && 
+                !cachedEntry.IsExpired(_settings.CacheLifetime) &&
+                cachedEntry.Data.Count > 0)
+            {
+                return CreateResultsFromItems(cachedEntry.Data, localCts.Token);
+            }
 
-            // HTTP request and JSON parsing with error handling
-            List<SvglApiResult> items;
+            // If not in cache or expired, do the API request
             try
             {
-                var response = await _httpClient.GetAsync(requestUrl, token);
-                if (!response.IsSuccessStatusCode)
+                // Check if we need to throttle API requests
+                await _apiSemaphore.WaitAsync(token);
+                try
                 {
+                    var timeSinceLastCall = now - _lastApiCallTime;
+                    if (timeSinceLastCall < TimeSpan.FromMilliseconds(ApiMinIntervalMs))
+                    {
+                        // Wait to prevent hitting API too quickly
+                        await Task.Delay(ApiMinIntervalMs - (int)timeSinceLastCall.TotalMilliseconds, token);
+                    }
+                    
+                    // Showing initial loading result
                     results.Add(new Result
                     {
-                        Title = $"SVGL API Error ({(int)response.StatusCode}): {response.ReasonPhrase}",
-                        SubTitle = "Rate limited or API issue, please try again later",
+                        Title = $"Searching for \"{search}\"...",
+                        SubTitle = "Querying SVGL API for icons",
+                        IcoPath = "icon.svg",
                         Action = _ => false
                     });
-                    return results;
+
+                    var requestUrl = $"https://api.svgl.app?search={Uri.EscapeDataString(search)}";
+                    var response = await _httpClient.GetAsync(requestUrl, token);
+                    _lastApiCallTime = DateTime.Now;
+                    
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        results.Clear();
+                        results.Add(new Result
+                        {
+                            Title = $"SVGL API Error ({(int)response.StatusCode}): {response.ReasonPhrase}",
+                            SubTitle = "Rate limited or API issue, please try again later",
+                            IcoPath = "icon.svg",
+                            Action = _ => false
+                        });
+                        return results;
+                    }
+                    
+                    var json = await response.Content.ReadAsStringAsync();
+                    var items = JsonConvert.DeserializeObject<List<SvglApiResult>>(json);
+                    
+                    // Update cache with expiration
+                    _searchCache[search] = new CacheEntry<List<SvglApiResult>>(items);
+                    
+                    // Return results from items
+                    return CreateResultsFromItems(items, localCts.Token);
                 }
-                var json = await response.Content.ReadAsStringAsync();
-                items = JsonConvert.DeserializeObject<List<SvglApiResult>>(json);
+                finally
+                {
+                    _apiSemaphore.Release();
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Query was canceled, return empty result
+                return new List<Result>();
             }
             catch (Exception ex)
             {
+                results.Clear();
                 results.Add(new Result
                 {
                     Title = "SVGL API Error",
                     SubTitle = ex.Message,
+                    IcoPath = "icon.svg",
                     Action = _ => false
                 });
                 return results;
-            }            foreach (var item in items)
+            }
+        }
+
+        /// <summary>
+        /// Creates results from API items
+        /// </summary>
+        private List<Result> CreateResultsFromItems(List<SvglApiResult> items, CancellationToken token)
+        {
+            var results = new List<Result>();
+            
+            if (items == null || items.Count == 0)
+            {
+                results.Add(new Result
+                {
+                    Title = "No icons found",
+                    SubTitle = "Try a different search term",
+                    IcoPath = "icon.svg",
+                    Action = _ => false
+                });
+                return results;
+            }
+            
+            foreach (var item in items)
             {
                 if (token.IsCancellationRequested)
                     return results;
@@ -127,67 +259,119 @@ namespace Flow.Launcher.Plugin.svgl
                 if (results.Count >= _settings.MaxResults * 2)
                     break;
 
-                // prepare local icon for light theme
-                var lightPath = Path.Combine(_cacheDir, $"{item.Id}_light.svg");
-                if (!File.Exists(lightPath))
+                try
                 {
-                    var svg = await _httpClient.GetStringAsync(item.Route.Light);
-                    File.WriteAllText(lightPath, svg);
+                    // Get or create the local icon files
+                    var (lightPath, darkPath, darkRawPath) = GetOrCreateIconFiles(item);
+
+                    // Light theme result
+                    results.Add(new Result
+                    {
+                        Title = $"{item.Title} (light)",
+                        SubTitle = $"Copy icon • {item.Category} • {item.Url}",
+                        IcoPath = lightPath,
+                        Score = 100, // Match the WebSearch scoring approach
+                        Action = _ =>
+                        {
+                            try
+                            {
+                                var svg = File.ReadAllText(lightPath);
+                                _context.API.CopyToClipboard(svg);
+                                _context.API.ShowMsg("SVG Copied", $"The {item.Title} (light) icon has been copied to clipboard");
+                                return true;
+                            }
+                            catch (Exception ex)
+                            {
+                                _context.API.ShowMsg("Error", $"Failed to copy SVG: {ex.Message}");
+                                return false;
+                            }
+                        }
+                    });
+
+                    // Dark theme result
+                    results.Add(new Result
+                    {
+                        Title = $"{item.Title} (dark)",
+                        SubTitle = $"Copy icon • {item.Category} • {item.Url}",
+                        IcoPath = darkPath,
+                        Score = 99, // Slightly lower score than light theme
+                        Action = _ =>
+                        {
+                            try
+                            {
+                                // copy original unedited SVG to clipboard
+                                var svg = File.ReadAllText(darkRawPath);
+                                _context.API.CopyToClipboard(svg);
+                                _context.API.ShowMsg("SVG Copied", $"The {item.Title} (dark) icon has been copied to clipboard");
+                                return true;
+                            }
+                            catch (Exception ex)
+                            {
+                                _context.API.ShowMsg("Error", $"Failed to copy SVG: {ex.Message}");
+                                return false;
+                            }
+                        }
+                    });
                 }
-
-                results.Add(new Result
+                catch (Exception ex)
                 {
-                    Title = $"{item.Title} (light)",
-                    SubTitle = item.Url,
-                    IcoPath = lightPath,
-                    Action = _ =>
-                    {
-                        _context.API.CopyToClipboard(File.ReadAllText(lightPath));
-                        return true;
-                    }
-                });
-
-                // prepare local icon for dark theme
-                var darkPath = Path.Combine(_cacheDir, $"{item.Id}_dark.svg");
-                var darkRawPath = Path.Combine(_cacheDir, $"{item.Id}_dark_raw.svg");
-                // cache raw SVG for dark theme
-                if (!File.Exists(darkRawPath))
-                {
-                    var rawSvg = await _httpClient.GetStringAsync(item.Route.Dark);
-                    File.WriteAllText(darkRawPath, rawSvg);
-                }                // generate modified SVG with black background if needed
-                if (!File.Exists(darkPath))
-                {
-                    var rawSvg = File.ReadAllText(darkRawPath);
-                    
-                    if (_settings.AddDarkBackground)
-                    {
-                        var tagEnd = rawSvg.IndexOf('>');
-                        var svgWithBg = rawSvg.Insert(tagEnd + 1, "<rect width=\"100%\" height=\"100%\" fill=\"black\" />");
-                        File.WriteAllText(darkPath, svgWithBg);
-                    }
-                    else
-                    {
-                        // If the background is disabled, just use the raw SVG for display
-                        File.WriteAllText(darkPath, rawSvg);
-                    }
+                    // Skip this item if there's an error processing it
+                    _context.API.LogException("SVGL Plugin", "Error processing SVG item", ex);
                 }
-
-                results.Add(new Result
-                {
-                    Title = $"{item.Title} (dark)",
-                    SubTitle = item.Url,
-                    IcoPath = darkPath,
-                    Action = _ =>
-                    {
-                        // copy original unedited SVG to clipboard
-                        var svg = File.ReadAllText(darkRawPath);
-                        _context.API.CopyToClipboard(svg);
-                        return true;
-                    }
-                });
             }
             return results;
+        }
+        
+        /// <summary>
+        /// Gets or creates the icon files for a given API result
+        /// </summary>
+        /// <param name="item">The API result item</param>
+        /// <returns>Tuple with paths to light, dark, and raw dark SVG files</returns>
+        private (string LightPath, string DarkPath, string DarkRawPath) GetOrCreateIconFiles(SvglApiResult item)
+        {
+            // prepare local icon for light theme
+            var lightPath = Path.Combine(_cacheDir, $"{item.Id}_light.svg");
+            if (!File.Exists(lightPath))
+            {
+                var svg = _httpClient.GetStringAsync(item.Route.Light).GetAwaiter().GetResult();
+                File.WriteAllText(lightPath, svg);
+            }
+
+            // prepare local icon for dark theme
+            var darkPath = Path.Combine(_cacheDir, $"{item.Id}_dark.svg");
+            var darkRawPath = Path.Combine(_cacheDir, $"{item.Id}_dark_raw.svg");
+            
+            // cache raw SVG for dark theme
+            if (!File.Exists(darkRawPath))
+            {
+                var rawSvg = _httpClient.GetStringAsync(item.Route.Dark).GetAwaiter().GetResult();
+                File.WriteAllText(darkRawPath, rawSvg);
+            }
+
+            // generate modified SVG with black background if needed
+            if (!File.Exists(darkPath) || _settings.AddDarkBackground != File.Exists(darkPath + ".hasbg"))
+            {
+                var rawSvg = File.ReadAllText(darkRawPath);
+                
+                if (_settings.AddDarkBackground)
+                {
+                    var tagEnd = rawSvg.IndexOf('>');
+                    var svgWithBg = rawSvg.Insert(tagEnd + 1, "<rect width=\"100%\" height=\"100%\" fill=\"black\" />");
+                    File.WriteAllText(darkPath, svgWithBg);
+                    // Create marker file to track background setting
+                    File.WriteAllText(darkPath + ".hasbg", "1");
+                }
+                else
+                {
+                    // If the background is disabled, just use the raw SVG for display
+                    File.WriteAllText(darkPath, rawSvg);
+                    // Remove marker file if it exists
+                    if (File.Exists(darkPath + ".hasbg"))
+                        File.Delete(darkPath + ".hasbg");
+                }
+            }
+            
+            return (lightPath, darkPath, darkRawPath);
         }
     }
 

@@ -52,6 +52,10 @@ namespace Flow.Launcher.Plugin.svgl
                             _context.API.ShowMsg($"Error deleting {Path.GetFileName(file)}", ex.Message);
                         }
                     }
+                    
+                    // Also clear the in-memory search cache
+                    ClearSearchCache();
+                    
                     _context.API.ShowMsg("Cache Cleared", $"Successfully deleted {files.Length} cached SVG files");
                 }
                 else
@@ -63,6 +67,15 @@ namespace Flow.Launcher.Plugin.svgl
             {
                 _context.API.ShowMsg("Error Clearing Cache", ex.Message);
             }
+        }
+        
+        /// <summary>
+        /// Clears the in-memory search cache - to be called from Main.cs
+        /// </summary>
+        public void ClearSearchCache()
+        {
+            // This will be implemented in Main.cs with a static method
+            Svgl.ClearSearchCache();
         }
     }
 }
