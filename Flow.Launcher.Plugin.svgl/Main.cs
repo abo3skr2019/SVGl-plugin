@@ -2,11 +2,15 @@ using System;
 using System.Collections.Generic;
 using System.Net.Http;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Flow.Launcher.Plugin;
 using System.IO;
 
 namespace Flow.Launcher.Plugin.svgl
 {
+    /// <summary>
+    /// SVGL Plugin for Flow Launcher to search and copy SVG icons
+    /// </summary>
     public class Svgl : IPlugin
     {
         private PluginInitContext _context;
@@ -14,15 +18,23 @@ namespace Flow.Launcher.Plugin.svgl
         // Debounce fields
         private static DateTime _lastQueryTime = DateTime.MinValue;
         private static string _lastSearchText = string.Empty;
-        private static readonly TimeSpan _debounceInterval = TimeSpan.FromMilliseconds(500);
-        private static readonly string _cacheDir = Path.Combine(Path.GetTempPath(), "FlowLauncher", "svgl_cache");
+        private static readonly TimeSpan _debounceInterval = TimeSpan.FromMilliseconds(500);        private static readonly string _cacheDir = Path.Combine(Path.GetTempPath(), "FlowLauncher", "svgl_cache");
 
+        /// <summary>
+        /// Initialize the plugin
+        /// </summary>
+        /// <param name="context">Context containing plugin API</param>
         public void Init(PluginInitContext context)
         {
             _context = context;
             Directory.CreateDirectory(_cacheDir);
         }
 
+        /// <summary>
+        /// Query the SVGL API for SVG icons
+        /// </summary>
+        /// <param name="query">Search query from Flow Launcher</param>
+        /// <returns>List of results with SVG icons</returns>
         public List<Result> Query(Query query)
         {
             var results = new List<Result>();
@@ -122,8 +134,7 @@ namespace Flow.Launcher.Plugin.svgl
                         return true;
                     }
                 });
-            }
-            return results;
+            }            return results;
         }
     }
 
@@ -133,6 +144,7 @@ namespace Flow.Launcher.Plugin.svgl
         public int Id { get; set; }
         public string Title { get; set; }
         public string Category { get; set; }
+        [JsonConverter(typeof(RouteInfoConverter))]
         public RouteInfo Route { get; set; }
         public WordmarkInfo Wordmark { get; set; }
         public string Url { get; set; }
@@ -149,5 +161,34 @@ namespace Flow.Launcher.Plugin.svgl
     {
         public string Light { get; set; }
         public string Dark { get; set; }
+    }
+    
+    // Custom JSON converter to handle both string and object formats for Route
+    class RouteInfoConverter : JsonConverter
+    {
+        public override bool CanConvert(Type objectType)
+        {
+            return objectType == typeof(RouteInfo);
+        }
+
+        public override object ReadJson(JsonReader reader, Type objectType, object existingValue, JsonSerializer serializer)
+        {
+            if (reader.TokenType == JsonToken.String)
+            {
+                // If the route is a string, create a RouteInfo with same URL for both light and dark
+                string url = reader.Value.ToString();
+                return new RouteInfo { Light = url, Dark = url };
+            }
+            else
+            {
+                // If it's an object, deserialize it normally
+                return serializer.Deserialize<RouteInfo>(reader);
+            }
+        }
+
+        public override void WriteJson(JsonWriter writer, object value, JsonSerializer serializer)
+        {
+            serializer.Serialize(writer, value);
+        }
     }
 }
