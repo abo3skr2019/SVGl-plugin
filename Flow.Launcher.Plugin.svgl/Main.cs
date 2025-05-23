@@ -7,20 +7,22 @@ using Flow.Launcher.Plugin;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows.Controls;
 
 namespace Flow.Launcher.Plugin.svgl
 {
     /// <summary>
     /// SVGL Plugin for Flow Launcher to search and copy SVG icons
     /// </summary>
-    public class Svgl : IPlugin, IAsyncPlugin
+    public class Svgl : IPlugin, IAsyncPlugin, ISettingProvider
     {
         private PluginInitContext _context;
+        private Settings _settings;
+        private SettingsViewModel _viewModel;
         private static readonly HttpClient _httpClient = new HttpClient();
         // Debounce fields
         private static DateTime _lastQueryTime = DateTime.MinValue;
         private static string _lastSearchText = string.Empty;
-        private static readonly TimeSpan _debounceInterval = TimeSpan.FromMilliseconds(500);
         private static readonly string _cacheDir = Path.Combine(Path.GetTempPath(), "FlowLauncher", "svgl_cache");
 
         /// <summary>
@@ -30,6 +32,8 @@ namespace Flow.Launcher.Plugin.svgl
         public void Init(PluginInitContext context)
         {
             _context = context;
+            _settings = _context.API.LoadSettingJsonStorage<Settings>();
+            _viewModel = new SettingsViewModel(_settings, context);
             Directory.CreateDirectory(_cacheDir);
         }
 
@@ -40,11 +44,20 @@ namespace Flow.Launcher.Plugin.svgl
         public Task InitAsync(PluginInitContext context)
         {
             _context = context;
+            _settings = _context.API.LoadSettingJsonStorage<Settings>();
+            _viewModel = new SettingsViewModel(_settings, context);
             Directory.CreateDirectory(_cacheDir);
             return Task.CompletedTask;
         }
 
         /// <summary>
+        /// Create the settings panel for the plugin
+        /// </summary>
+        /// <returns>Settings control</returns>
+        public Control CreateSettingPanel()
+        {
+            return new SettingsControl(_context, _viewModel);
+        }        /// <summary>
         /// Query the SVGL API for SVG icons (sync version, calls async method)
         /// </summary>
         /// <param name="query">Search query from Flow Launcher</param>
@@ -69,8 +82,9 @@ namespace Flow.Launcher.Plugin.svgl
 
             var now = DateTime.Now;
             // If search text changed and user is still typing (within debounce interval), skip
+            var debounceInterval = TimeSpan.FromMilliseconds(_settings.DebounceInterval);
             if (!search.Equals(_lastSearchText, StringComparison.OrdinalIgnoreCase) &&
-                now - _lastQueryTime < _debounceInterval)
+                now - _lastQueryTime < debounceInterval)
                 return results;
             _lastSearchText = search;
             _lastQueryTime = now;
@@ -104,12 +118,14 @@ namespace Flow.Launcher.Plugin.svgl
                     Action = _ => false
                 });
                 return results;
-            }
-
-            foreach (var item in items)
+            }            foreach (var item in items)
             {
                 if (token.IsCancellationRequested)
                     return results;
+                    
+                // Limit results based on settings (each item produces 2 results - light and dark)
+                if (results.Count >= _settings.MaxResults * 2)
+                    break;
 
                 // prepare local icon for light theme
                 var lightPath = Path.Combine(_cacheDir, $"{item.Id}_light.svg");
@@ -139,14 +155,22 @@ namespace Flow.Launcher.Plugin.svgl
                 {
                     var rawSvg = await _httpClient.GetStringAsync(item.Route.Dark);
                     File.WriteAllText(darkRawPath, rawSvg);
-                }
-                // generate modified SVG with black background if needed
+                }                // generate modified SVG with black background if needed
                 if (!File.Exists(darkPath))
                 {
                     var rawSvg = File.ReadAllText(darkRawPath);
-                    var tagEnd = rawSvg.IndexOf('>');
-                    var svgWithBg = rawSvg.Insert(tagEnd + 1, "<rect width=\"100%\" height=\"100%\" fill=\"black\" />");
-                    File.WriteAllText(darkPath, svgWithBg);
+                    
+                    if (_settings.AddDarkBackground)
+                    {
+                        var tagEnd = rawSvg.IndexOf('>');
+                        var svgWithBg = rawSvg.Insert(tagEnd + 1, "<rect width=\"100%\" height=\"100%\" fill=\"black\" />");
+                        File.WriteAllText(darkPath, svgWithBg);
+                    }
+                    else
+                    {
+                        // If the background is disabled, just use the raw SVG for display
+                        File.WriteAllText(darkPath, rawSvg);
+                    }
                 }
 
                 results.Add(new Result
