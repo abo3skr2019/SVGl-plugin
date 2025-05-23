@@ -5,20 +5,23 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Flow.Launcher.Plugin;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Flow.Launcher.Plugin.svgl
 {
     /// <summary>
     /// SVGL Plugin for Flow Launcher to search and copy SVG icons
     /// </summary>
-    public class Svgl : IPlugin
+    public class Svgl : IPlugin, IAsyncPlugin
     {
         private PluginInitContext _context;
         private static readonly HttpClient _httpClient = new HttpClient();
         // Debounce fields
         private static DateTime _lastQueryTime = DateTime.MinValue;
         private static string _lastSearchText = string.Empty;
-        private static readonly TimeSpan _debounceInterval = TimeSpan.FromMilliseconds(500);        private static readonly string _cacheDir = Path.Combine(Path.GetTempPath(), "FlowLauncher", "svgl_cache");
+        private static readonly TimeSpan _debounceInterval = TimeSpan.FromMilliseconds(500);
+        private static readonly string _cacheDir = Path.Combine(Path.GetTempPath(), "FlowLauncher", "svgl_cache");
 
         /// <summary>
         /// Initialize the plugin
@@ -31,11 +34,33 @@ namespace Flow.Launcher.Plugin.svgl
         }
 
         /// <summary>
-        /// Query the SVGL API for SVG icons
+        /// Initialize the plugin asynchronously
+        /// </summary>
+        /// <param name="context">Context containing plugin API</param>
+        public Task InitAsync(PluginInitContext context)
+        {
+            _context = context;
+            Directory.CreateDirectory(_cacheDir);
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Query the SVGL API for SVG icons (sync version, calls async method)
         /// </summary>
         /// <param name="query">Search query from Flow Launcher</param>
         /// <returns>List of results with SVG icons</returns>
         public List<Result> Query(Query query)
+        {
+            return QueryAsync(query, CancellationToken.None).GetAwaiter().GetResult();
+        }
+
+        /// <summary>
+        /// Query the SVGL API for SVG icons (async version)
+        /// </summary>
+        /// <param name="query">Search query from Flow Launcher</param>
+        /// <param name="token">Cancellation token</param>
+        /// <returns>List of results with SVG icons</returns>
+        public async Task<List<Result>> QueryAsync(Query query, CancellationToken token)
         {
             var results = new List<Result>();
             var raw = query.Search; // preserve original including trailing whitespace
@@ -56,7 +81,7 @@ namespace Flow.Launcher.Plugin.svgl
             List<SvglApiResult> items;
             try
             {
-                var response = _httpClient.GetAsync(requestUrl).GetAwaiter().GetResult();
+                var response = await _httpClient.GetAsync(requestUrl, token);
                 if (!response.IsSuccessStatusCode)
                 {
                     results.Add(new Result
@@ -67,7 +92,7 @@ namespace Flow.Launcher.Plugin.svgl
                     });
                     return results;
                 }
-                var json = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                var json = await response.Content.ReadAsStringAsync();
                 items = JsonConvert.DeserializeObject<List<SvglApiResult>>(json);
             }
             catch (Exception ex)
@@ -83,11 +108,14 @@ namespace Flow.Launcher.Plugin.svgl
 
             foreach (var item in items)
             {
+                if (token.IsCancellationRequested)
+                    return results;
+
                 // prepare local icon for light theme
                 var lightPath = Path.Combine(_cacheDir, $"{item.Id}_light.svg");
                 if (!File.Exists(lightPath))
                 {
-                    var svg = _httpClient.GetStringAsync(item.Route.Light).GetAwaiter().GetResult();
+                    var svg = await _httpClient.GetStringAsync(item.Route.Light);
                     File.WriteAllText(lightPath, svg);
                 }
 
@@ -109,7 +137,7 @@ namespace Flow.Launcher.Plugin.svgl
                 // cache raw SVG for dark theme
                 if (!File.Exists(darkRawPath))
                 {
-                    var rawSvg = _httpClient.GetStringAsync(item.Route.Dark).GetAwaiter().GetResult();
+                    var rawSvg = await _httpClient.GetStringAsync(item.Route.Dark);
                     File.WriteAllText(darkRawPath, rawSvg);
                 }
                 // generate modified SVG with black background if needed
@@ -134,7 +162,8 @@ namespace Flow.Launcher.Plugin.svgl
                         return true;
                     }
                 });
-            }            return results;
+            }
+            return results;
         }
     }
 
