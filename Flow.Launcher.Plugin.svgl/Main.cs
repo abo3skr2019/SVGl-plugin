@@ -127,29 +127,10 @@ namespace Flow.Launcher.Plugin.svgl
             var localCts = _currentRequestCts;
 
             var now = DateTime.Now;
-            
-            // If search text changed and user is still typing (within debounce interval), show loading state
-            var debounceInterval = TimeSpan.FromMilliseconds(_settings.DebounceInterval);
-            if (!search.Equals(_lastSearchText, StringComparison.OrdinalIgnoreCase) &&
-                now - _lastQueryTime < debounceInterval)
-            {
-                _lastSearchText = search;
-                _lastQueryTime = now;
-                
-                results.Add(new Result
-                {
-                    Title = $"Searching for \"{search}\"...",
-                    SubTitle = "Please wait while searching SVGL icons",
-                    IcoPath = "icon.svg",
-                    Action = _ => false
-                });
-                return results;
-            }
-            
             _lastSearchText = search;
             _lastQueryTime = now;
-
-            // Check cache first with expiration
+            
+            // Check cache first with expiration - always return immediately if we have cached results
             if (_searchCache.TryGetValue(search, out var cachedEntry) && 
                 cachedEntry != null && 
                 !cachedEntry.IsExpired(_settings.CacheLifetime) &&
@@ -161,7 +142,8 @@ namespace Flow.Launcher.Plugin.svgl
             // If not in cache or expired, do the API request
             try
             {
-                // Check if we need to throttle API requests
+                // Important fix: Always execute the API call instead of returning a loading message
+                // We still throttle API requests for rate limiting
                 await _apiSemaphore.WaitAsync(token);
                 try
                 {
@@ -172,7 +154,7 @@ namespace Flow.Launcher.Plugin.svgl
                         await Task.Delay(ApiMinIntervalMs - (int)timeSinceLastCall.TotalMilliseconds, token);
                     }
                     
-                    // Showing initial loading result
+                    // Showing loading results but still continuing with the request
                     results.Add(new Result
                     {
                         Title = $"Searching for \"{search}\"...",
