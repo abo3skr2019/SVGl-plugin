@@ -25,24 +25,34 @@ namespace Flow.Launcher.Plugin.svgl
         private static Dictionary<string, CacheEntry<List<SvglApiResult>>> _searchCache = 
             new Dictionary<string, CacheEntry<List<SvglApiResult>>>(StringComparer.OrdinalIgnoreCase);
         private static readonly string _cacheDir = Path.Combine(Path.GetTempPath(), "FlowLauncher", "svgl_cache");
-        
-        // Debounce and API request tracking
+          // Debounce and API request tracking
         private static CancellationTokenSource _currentRequestCts;
         private static DateTime _lastQueryTime = DateTime.MinValue;
         private static string _lastSearchText = string.Empty;
         private static DateTime _lastApiCallTime = DateTime.MinValue;
         private static SemaphoreSlim _apiSemaphore = new SemaphoreSlim(1, 1);
+        private static Timer _debounceTimer;
+        private static Queue<DateTime> _apiCallTimes = new Queue<DateTime>();
         
         // API rate limiting - default to max 10 requests per minute
         private const int ApiMinIntervalMs = 100; // Minimum time between API calls
         private const int ApiMaxPerMinute = 10;   // Maximum API calls per minute
-        
-        /// <summary>
+          /// <summary>
         /// Clears the in-memory search cache
         /// </summary>
         public static void ClearSearchCache()
         {
             _searchCache.Clear();
+        }
+
+        /// <summary>
+        /// Cleanup method to dispose of resources
+        /// </summary>
+        public static void Cleanup()
+        {
+            _debounceTimer?.Dispose();
+            _currentRequestCts?.Cancel();
+            _currentRequestCts?.Dispose();
         }
 
         /// <summary>
@@ -87,9 +97,7 @@ namespace Flow.Launcher.Plugin.svgl
         public List<Result> Query(Query query)
         {
             return QueryAsync(query, CancellationToken.None).GetAwaiter().GetResult();
-        }
-
-        /// <summary>
+        }        /// <summary>
         /// Query the SVGL API for SVG icons (async version)
         /// </summary>
         /// <param name="query">Search query from Flow Launcher</param>
@@ -122,6 +130,9 @@ namespace Flow.Launcher.Plugin.svgl
                 _currentRequestCts = null;
             }
 
+            // Dispose existing debounce timer
+            _debounceTimer?.Dispose();
+
             // Create new cancellation token source linked to the provided token
             _currentRequestCts = CancellationTokenSource.CreateLinkedTokenSource(token);
             var localCts = _currentRequestCts;
@@ -139,37 +150,108 @@ namespace Flow.Launcher.Plugin.svgl
                 return CreateResultsFromItems(cachedEntry.Data, localCts.Token);
             }
 
-            // If not in cache or expired, do the API request
-            try
+            // Implement proper debouncing using the settings
+            if (_settings.DebounceInterval > 0)
             {
-                // Important fix: Always execute the API call instead of returning a loading message
-                // We still throttle API requests for rate limiting
-                await _apiSemaphore.WaitAsync(token);
-                try
+                var timeSinceLastQuery = now - _lastQueryTime;
+                if (timeSinceLastQuery < TimeSpan.FromMilliseconds(_settings.DebounceInterval))
                 {
-                    var timeSinceLastCall = now - _lastApiCallTime;
-                    if (timeSinceLastCall < TimeSpan.FromMilliseconds(ApiMinIntervalMs))
-                    {
-                        // Wait to prevent hitting API too quickly
-                        await Task.Delay(ApiMinIntervalMs - (int)timeSinceLastCall.TotalMilliseconds, token);
-                    }
+                    // Start debounce timer
+                    var delayMs = _settings.DebounceInterval - (int)timeSinceLastQuery.TotalMilliseconds;
                     
-                    // Showing loading results but still continuing with the request
+                    var tcs = new TaskCompletionSource<List<Result>>();
+                    _debounceTimer = new Timer(async _ =>
+                    {
+                        try
+                        {
+                            if (!localCts.Token.IsCancellationRequested && search == _lastSearchText)
+                            {
+                                var debouncedResults = await PerformApiRequest(search, localCts.Token);
+                                tcs.SetResult(debouncedResults);
+                            }
+                            else
+                            {
+                                tcs.SetResult(new List<Result>());
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            tcs.SetException(ex);
+                        }
+                        finally
+                        {
+                            _debounceTimer?.Dispose();
+                        }
+                    }, null, delayMs, Timeout.Infinite);
+                    
+                    // Return loading result while debouncing
                     results.Add(new Result
                     {
                         Title = $"Searching for \"{search}\"...",
-                        SubTitle = "Querying SVGL API for icons",
+                        SubTitle = "Debouncing search query...",
                         IcoPath = "icon.svg",
                         Action = _ => false
                     });
+                    return results;
+                }
+            }
+
+            // No debounce needed or debounce interval is 0, proceed immediately
+            return await PerformApiRequest(search, localCts.Token);
+        }
+
+        /// <summary>
+        /// Performs the actual API request with proper rate limiting
+        /// </summary>
+        /// <param name="search">Search term</param>
+        /// <param name="token">Cancellation token</param>
+        /// <returns>List of results</returns>
+        private async Task<List<Result>> PerformApiRequest(string search, CancellationToken token)
+        {
+            var results = new List<Result>();
+
+            try
+            {
+                await _apiSemaphore.WaitAsync(token);
+                try
+                {
+                    var now = DateTime.Now;
+                    
+                    // Clean up old API call times (older than 1 minute)
+                    while (_apiCallTimes.Count > 0 && _apiCallTimes.Peek() < now.AddMinutes(-1))
+                    {
+                        _apiCallTimes.Dequeue();
+                    }
+                    
+                    // Check if we've hit the rate limit
+                    if (_apiCallTimes.Count >= ApiMaxPerMinute)
+                    {
+                        results.Add(new Result
+                        {
+                            Title = "Rate limit exceeded",
+                            SubTitle = $"Maximum {ApiMaxPerMinute} API calls per minute reached. Please wait.",
+                            IcoPath = "icon.svg",
+                            Action = _ => false
+                        });
+                        return results;
+                    }
+                    
+                    // Enforce minimum interval between API calls
+                    var timeSinceLastCall = now - _lastApiCallTime;
+                    if (timeSinceLastCall < TimeSpan.FromMilliseconds(ApiMinIntervalMs))
+                    {
+                        await Task.Delay(ApiMinIntervalMs - (int)timeSinceLastCall.TotalMilliseconds, token);
+                    }
+                    
+                    // Record this API call
+                    _apiCallTimes.Enqueue(now);
+                    _lastApiCallTime = now;
 
                     var requestUrl = $"https://api.svgl.app?search={Uri.EscapeDataString(search)}";
                     var response = await _httpClient.GetAsync(requestUrl, token);
-                    _lastApiCallTime = DateTime.Now;
                     
                     if (!response.IsSuccessStatusCode)
                     {
-                        results.Clear();
                         results.Add(new Result
                         {
                             Title = $"SVGL API Error ({(int)response.StatusCode}): {response.ReasonPhrase}",
@@ -187,7 +269,7 @@ namespace Flow.Launcher.Plugin.svgl
                     _searchCache[search] = new CacheEntry<List<SvglApiResult>>(items);
                     
                     // Return results from items
-                    return CreateResultsFromItems(items, localCts.Token);
+                    return CreateResultsFromItems(items, token);
                 }
                 finally
                 {
@@ -201,7 +283,6 @@ namespace Flow.Launcher.Plugin.svgl
             }
             catch (Exception ex)
             {
-                results.Clear();
                 results.Add(new Result
                 {
                     Title = "SVGL API Error",
