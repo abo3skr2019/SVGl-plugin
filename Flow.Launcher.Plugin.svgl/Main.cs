@@ -24,14 +24,12 @@ namespace Flow.Launcher.Plugin.svgl
         // Cache system with expiration
         private static Dictionary<string, CacheEntry<List<SvglApiResult>>> _searchCache = 
             new Dictionary<string, CacheEntry<List<SvglApiResult>>>(StringComparer.OrdinalIgnoreCase);
-        private static readonly string _cacheDir = Path.Combine(Path.GetTempPath(), "FlowLauncher", "svgl_cache");
-          // Debounce and API request tracking
+        private static readonly string _cacheDir = Path.Combine(Path.GetTempPath(), "FlowLauncher", "svgl_cache");        // Debounce and API request tracking
         private static CancellationTokenSource _currentRequestCts;
         private static DateTime _lastQueryTime = DateTime.MinValue;
         private static string _lastSearchText = string.Empty;
         private static DateTime _lastApiCallTime = DateTime.MinValue;
         private static SemaphoreSlim _apiSemaphore = new SemaphoreSlim(1, 1);
-        private static Timer _debounceTimer;
         private static Queue<DateTime> _apiCallTimes = new Queue<DateTime>();
         
         // API rate limiting - default to max 10 requests per minute
@@ -43,14 +41,11 @@ namespace Flow.Launcher.Plugin.svgl
         public static void ClearSearchCache()
         {
             _searchCache.Clear();
-        }
-
-        /// <summary>
+        }        /// <summary>
         /// Cleanup method to dispose of resources
         /// </summary>
         public static void Cleanup()
         {
-            _debounceTimer?.Dispose();
             _currentRequestCts?.Cancel();
             _currentRequestCts?.Dispose();
         }
@@ -127,11 +122,7 @@ namespace Flow.Launcher.Plugin.svgl
             {
                 _currentRequestCts.Cancel();
                 _currentRequestCts.Dispose();
-                _currentRequestCts = null;
-            }
-
-            // Dispose existing debounce timer
-            _debounceTimer?.Dispose();
+                _currentRequestCts = null;            }
 
             // Create new cancellation token source linked to the provided token
             _currentRequestCts = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -139,7 +130,6 @@ namespace Flow.Launcher.Plugin.svgl
 
             var now = DateTime.Now;
             _lastSearchText = search;
-            _lastQueryTime = now;
             
             // Check cache first with expiration - always return immediately if we have cached results
             if (_searchCache.TryGetValue(search, out var cachedEntry) && 
@@ -156,45 +146,20 @@ namespace Flow.Launcher.Plugin.svgl
                 var timeSinceLastQuery = now - _lastQueryTime;
                 if (timeSinceLastQuery < TimeSpan.FromMilliseconds(_settings.DebounceInterval))
                 {
-                    // Start debounce timer
+                    // Wait for the remaining debounce time
                     var delayMs = _settings.DebounceInterval - (int)timeSinceLastQuery.TotalMilliseconds;
+                    await Task.Delay(delayMs, localCts.Token);
                     
-                    var tcs = new TaskCompletionSource<List<Result>>();
-                    _debounceTimer = new Timer(async _ =>
+                    // Check if the query is still current after delay
+                    if (localCts.Token.IsCancellationRequested || search != _lastSearchText)
                     {
-                        try
-                        {
-                            if (!localCts.Token.IsCancellationRequested && search == _lastSearchText)
-                            {
-                                var debouncedResults = await PerformApiRequest(search, localCts.Token);
-                                tcs.SetResult(debouncedResults);
-                            }
-                            else
-                            {
-                                tcs.SetResult(new List<Result>());
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            tcs.SetException(ex);
-                        }
-                        finally
-                        {
-                            _debounceTimer?.Dispose();
-                        }
-                    }, null, delayMs, Timeout.Infinite);
-                    
-                    // Return loading result while debouncing
-                    results.Add(new Result
-                    {
-                        Title = $"Searching for \"{search}\"...",
-                        SubTitle = "Debouncing search query...",
-                        IcoPath = "icon.svg",
-                        Action = _ => false
-                    });
-                    return results;
+                        return new List<Result>();
+                    }
                 }
             }
+
+            // Update query time when proceeding with API request
+            _lastQueryTime = DateTime.Now;
 
             // No debounce needed or debounce interval is 0, proceed immediately
             return await PerformApiRequest(search, localCts.Token);
