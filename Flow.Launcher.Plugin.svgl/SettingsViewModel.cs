@@ -28,9 +28,7 @@ namespace Flow.Launcher.Plugin.svgl
             
             // Set the cache path for display
             Settings.CachePath = Path.Combine(Path.GetTempPath(), "FlowLauncher", "svgl_cache");
-        }
-
-        /// <summary>
+        }        /// <summary>
         /// Clears the SVG cache files
         /// </summary>
         public void ClearCacheCommand()
@@ -38,30 +36,30 @@ namespace Flow.Launcher.Plugin.svgl
             try
             {
                 var cacheDir = Settings.CachePath;
+                int deletedCount = 0;
+                
                 if (Directory.Exists(cacheDir))
                 {
-                    var files = Directory.GetFiles(cacheDir, "*.svg");
+                    var files = Directory.GetFiles(cacheDir);
                     foreach (var file in files)
                     {
                         try
                         {
                             File.Delete(file);
+                            deletedCount++;
                         }
                         catch (Exception ex)
                         {
-                            _context.API.ShowMsg($"Error deleting {Path.GetFileName(file)}", ex.Message);
+                            _context.API.LogException("SVGL Plugin", $"Error deleting {Path.GetFileName(file)}", ex);
                         }
                     }
-                    
-                    // Also clear the in-memory search cache
-                    ClearSearchCache();
-                    
-                    _context.API.ShowMsg("Cache Cleared", $"Successfully deleted {files.Length} cached SVG files");
                 }
-                else
-                {
-                    _context.API.ShowMsg("Cache Directory Not Found", "The cache directory does not exist.");
-                }
+                
+                // Also clear the in-memory search cache
+                ClearSearchCache();
+                
+                _context.API.ShowMsg("Cache Cleared", 
+                    $"Successfully cleared cache. Deleted {deletedCount} files and cleared search cache.");
             }
             catch (Exception ex)
             {

@@ -32,15 +32,36 @@ namespace Flow.Launcher.Plugin.svgl
         private static SemaphoreSlim _apiSemaphore = new SemaphoreSlim(1, 1);
         private static Queue<DateTime> _apiCallTimes = new Queue<DateTime>();
         
-        // API rate limiting - default to max 10 requests per minute
+        // Debounce timer for improved debouncing
+        private static System.Threading.Timer _debounceTimer;
+        private static string _pendingQuery = string.Empty;
+        private static TaskCompletionSource<List<Result>> _pendingRequest;
+          // API rate limiting - default to max 10 requests per minute
         private const int ApiMinIntervalMs = 100; // Minimum time between API calls
         private const int ApiMaxPerMinute = 10;   // Maximum API calls per minute
-          /// <summary>
+        
+        /// <summary>
         /// Clears the in-memory search cache
         /// </summary>
         public static void ClearSearchCache()
         {
             _searchCache.Clear();
+            
+            // Also clear the file cache directory
+            try
+            {
+                if (Directory.Exists(_cacheDir))
+                {
+                    foreach (var file in Directory.GetFiles(_cacheDir))
+                    {
+                        File.Delete(file);
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore file deletion errors
+            }
         }        /// <summary>
         /// Cleanup method to dispose of resources
         /// </summary>
@@ -48,6 +69,7 @@ namespace Flow.Launcher.Plugin.svgl
         {
             _currentRequestCts?.Cancel();
             _currentRequestCts?.Dispose();
+            _debounceTimer?.Dispose();
         }
 
         /// <summary>
@@ -100,72 +122,107 @@ namespace Flow.Launcher.Plugin.svgl
         /// <returns>List of results with SVG icons</returns>
         public async Task<List<Result>> QueryAsync(Query query, CancellationToken token)
         {
-            var results = new List<Result>();
             var raw = query.Search; // preserve original including trailing whitespace
             var search = raw?.Trim();
             
             if (string.IsNullOrEmpty(search))
             {
                 // When no search is provided, show placeholder result
-                results.Add(new Result
+                return new List<Result>
                 {
-                    Title = "Search for SVG Icons",
-                    SubTitle = "Start typing to search for icons...",
-                    IcoPath = "icon.svg",
-                    Action = _ => false
-                });
-                return results;
+                    new Result
+                    {
+                        Title = "Search for SVG Icons",
+                        SubTitle = "Start typing to search for icons...",
+                        IcoPath = "icon.svg",
+                        Action = _ => false
+                    }
+                };
             }
 
-            // Cancel any ongoing requests when user changes query
-            if (_currentRequestCts != null && search != _lastSearchText)
-            {
-                _currentRequestCts.Cancel();
-                _currentRequestCts.Dispose();
-                _currentRequestCts = null;            }
-
-            // Create new cancellation token source linked to the provided token
-            _currentRequestCts = CancellationTokenSource.CreateLinkedTokenSource(token);
-            var localCts = _currentRequestCts;
-
-            var now = DateTime.Now;
-            _lastSearchText = search;
-            
-            // Check cache first with expiration - always return immediately if we have cached results
+            // Check cache first - if we have valid cached results, return immediately
             if (_searchCache.TryGetValue(search, out var cachedEntry) && 
                 cachedEntry != null && 
-                !cachedEntry.IsExpired(_settings.CacheLifetime) &&
-                cachedEntry.Data.Count > 0)
+                !cachedEntry.IsExpired(_settings.CacheLifetime))
             {
-                return CreateResultsFromItems(cachedEntry.Data, localCts.Token);
+                return CreateResultsFromItems(cachedEntry.Data, token);
             }
 
-            // Implement proper debouncing using the settings
+            // Improved debouncing logic
             if (_settings.DebounceInterval > 0)
             {
-                var timeSinceLastQuery = now - _lastQueryTime;
-                if (timeSinceLastQuery < TimeSpan.FromMilliseconds(_settings.DebounceInterval))
-                {
-                    // Wait for the remaining debounce time
-                    var delayMs = _settings.DebounceInterval - (int)timeSinceLastQuery.TotalMilliseconds;
-                    await Task.Delay(delayMs, localCts.Token);
-                    
-                    // Check if the query is still current after delay
-                    if (localCts.Token.IsCancellationRequested || search != _lastSearchText)
-                    {
-                        return new List<Result>();
-                    }
-                }
+                return await PerformDebouncedSearch(search, token);
             }
-
-            // Update query time when proceeding with API request
-            _lastQueryTime = DateTime.Now;
-
-            // No debounce needed or debounce interval is 0, proceed immediately
-            return await PerformApiRequest(search, localCts.Token);
+            else
+            {
+                // No debouncing, perform search immediately
+                return await PerformApiRequest(search, token);
+            }
         }
 
         /// <summary>
+        /// Performs debounced search using timer-based approach
+        /// </summary>
+        /// <param name="search">Search term</param>
+        /// <param name="token">Cancellation token</param>
+        /// <returns>List of results</returns>
+        private async Task<List<Result>> PerformDebouncedSearch(string search, CancellationToken token)
+        {
+            // Cancel any existing request
+            _currentRequestCts?.Cancel();
+            _currentRequestCts?.Dispose();
+
+            // Create new cancellation token source
+            _currentRequestCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+            var localCts = _currentRequestCts;
+
+            _pendingQuery = search;
+
+            // Create a task completion source for this request
+            var tcs = new TaskCompletionSource<List<Result>>();
+            _pendingRequest = tcs;
+
+            // Dispose existing timer and create new one
+            _debounceTimer?.Dispose();
+            _debounceTimer = new System.Threading.Timer(async _ =>
+            {
+                try
+                {
+                    if (!localCts.Token.IsCancellationRequested && _pendingQuery == search)
+                    {
+                        var results = await PerformApiRequest(search, localCts.Token);
+                        if (!tcs.Task.IsCompleted)
+                        {
+                            tcs.SetResult(results);
+                        }
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    if (!tcs.Task.IsCompleted)
+                    {
+                        tcs.SetResult(new List<Result>());
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (!tcs.Task.IsCompleted)
+                    {
+                        tcs.SetException(ex);
+                    }
+                }
+            }, null, _settings.DebounceInterval, Timeout.Infinite);
+
+            // Wait for the debounced result or cancellation
+            try
+            {
+                return await tcs.Task;
+            }
+            catch (OperationCanceledException)
+            {
+                return new List<Result>();
+            }
+        }        /// <summary>
         /// Performs the actual API request with proper rate limiting
         /// </summary>
         /// <param name="search">Search term</param>
@@ -228,10 +285,16 @@ namespace Flow.Launcher.Plugin.svgl
                     }
                     
                     var json = await response.Content.ReadAsStringAsync();
-                    var items = JsonConvert.DeserializeObject<List<SvglApiResult>>(json);
+                    var items = JsonConvert.DeserializeObject<List<SvglApiResult>>(json) ?? new List<SvglApiResult>();
                     
-                    // Update cache with expiration
-                    _searchCache[search] = new CacheEntry<List<SvglApiResult>>(items);
+                    // Update cache with expiration only if cache lifetime > 0
+                    if (_settings.CacheLifetime > 0)
+                    {
+                        _searchCache[search] = new CacheEntry<List<SvglApiResult>>(items);
+                        
+                        // Clean up expired cache entries to prevent memory bloat
+                        CleanupExpiredCache();
+                    }
                     
                     // Return results from items
                     return CreateResultsFromItems(items, token);
@@ -256,6 +319,27 @@ namespace Flow.Launcher.Plugin.svgl
                     Action = _ => false
                 });
                 return results;
+            }
+        }
+
+        /// <summary>
+        /// Cleans up expired cache entries to prevent memory bloat
+        /// </summary>
+        private void CleanupExpiredCache()
+        {
+            var keysToRemove = new List<string>();
+            
+            foreach (var kvp in _searchCache)
+            {
+                if (kvp.Value.IsExpired(_settings.CacheLifetime))
+                {
+                    keysToRemove.Add(kvp.Key);
+                }
+            }
+            
+            foreach (var key in keysToRemove)
+            {
+                _searchCache.Remove(key);
             }
         }
 
@@ -349,8 +433,7 @@ namespace Flow.Launcher.Plugin.svgl
             }
             return results;
         }
-        
-        /// <summary>
+          /// <summary>
         /// Gets or creates the icon files for a given API result
         /// </summary>
         /// <param name="item">The API result item</param>
@@ -359,7 +442,7 @@ namespace Flow.Launcher.Plugin.svgl
         {
             // prepare local icon for light theme
             var lightPath = Path.Combine(_cacheDir, $"{item.Id}_light.svg");
-            if (!File.Exists(lightPath))
+            if (!File.Exists(lightPath) || IsFileCacheExpired(lightPath))
             {
                 var svg = _httpClient.GetStringAsync(item.Route.Light).GetAwaiter().GetResult();
                 File.WriteAllText(lightPath, svg);
@@ -370,14 +453,16 @@ namespace Flow.Launcher.Plugin.svgl
             var darkRawPath = Path.Combine(_cacheDir, $"{item.Id}_dark_raw.svg");
             
             // cache raw SVG for dark theme
-            if (!File.Exists(darkRawPath))
+            if (!File.Exists(darkRawPath) || IsFileCacheExpired(darkRawPath))
             {
                 var rawSvg = _httpClient.GetStringAsync(item.Route.Dark).GetAwaiter().GetResult();
                 File.WriteAllText(darkRawPath, rawSvg);
             }
 
             // generate modified SVG with black background if needed
-            if (!File.Exists(darkPath) || _settings.AddDarkBackground != File.Exists(darkPath + ".hasbg"))
+            if (!File.Exists(darkPath) || 
+                _settings.AddDarkBackground != File.Exists(darkPath + ".hasbg") ||
+                IsFileCacheExpired(darkPath))
             {
                 var rawSvg = File.ReadAllText(darkRawPath);
                 
@@ -400,6 +485,24 @@ namespace Flow.Launcher.Plugin.svgl
             }
             
             return (lightPath, darkPath, darkRawPath);
+        }
+
+        /// <summary>
+        /// Checks if a cached file has expired based on settings
+        /// </summary>
+        /// <param name="filePath">Path to the cached file</param>
+        /// <returns>True if expired or cache is disabled, false otherwise</returns>
+        private bool IsFileCacheExpired(string filePath)
+        {
+            // If cache lifetime is 0, consider files always expired (no file caching)
+            if (_settings.CacheLifetime <= 0)
+                return true;
+
+            if (!File.Exists(filePath))
+                return true;
+
+            var fileAge = DateTime.Now - File.GetLastWriteTime(filePath);
+            return fileAge > TimeSpan.FromMinutes(_settings.CacheLifetime);
         }
     }
 
