@@ -316,7 +316,12 @@ namespace Flow.Launcher.Plugin.svgl
                     Title = "SVGL API Error",
                     SubTitle = ex.Message,
                     IcoPath = "icon.svg",
-                    Action = _ => false
+                    Action = _ =>
+                    {
+                        _context.API.CopyToClipboard(ex.ToString());
+                        _context.API.ShowMsg("Error Copied", "An error occurred while querying the SVGL API. Details copied to clipboard.");
+                        return true;
+                    }
                 });
                 return results;
             }
